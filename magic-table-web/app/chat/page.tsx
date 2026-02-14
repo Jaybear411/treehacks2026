@@ -74,6 +74,41 @@ export default function ChatPage() {
     }
   }
 
+  async function handleAction(endpoint: string, label: string) {
+    if (loading) return;
+
+    setMessages((prev) => [...prev, { role: "user", text: label }]);
+    setLoading(true);
+
+    try {
+      const res = await fetch(`${serverUrl}${endpoint}`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({}),
+      });
+
+      const data = await res.json();
+
+      const reply =
+        data.reply ||
+        data.error ||
+        "No response from server.";
+
+      setMessages((prev) => [...prev, { role: "assistant", text: reply }]);
+    } catch (err) {
+      setMessages((prev) => [
+        ...prev,
+        {
+          role: "assistant",
+          text: `Could not reach server at ${serverUrl}. Is it running?`,
+        },
+      ]);
+    } finally {
+      setLoading(false);
+      inputRef.current?.focus();
+    }
+  }
+
   function handleLogout() {
     sessionStorage.clear();
     router.replace("/");
@@ -129,6 +164,26 @@ export default function ChatPage() {
         )}
 
         <div ref={bottomRef} />
+      </div>
+
+      {/* Quick-action buttons */}
+      <div className="px-4 pt-2 flex gap-2">
+        <button
+          onClick={() =>
+            handleAction("/api/describe", "What's on the table?")
+          }
+          disabled={loading}
+          className="flex-1 border border-gray-300 rounded-lg px-3 py-2 text-sm font-medium text-gray-700 hover:bg-gray-50 active:bg-gray-100 transition-colors disabled:opacity-30"
+        >
+          What&apos;s on the table?
+        </button>
+        <button
+          onClick={() => handleAction("/api/cleanup", "Clean up the table")}
+          disabled={loading}
+          className="flex-1 border border-gray-300 rounded-lg px-3 py-2 text-sm font-medium text-gray-700 hover:bg-gray-50 active:bg-gray-100 transition-colors disabled:opacity-30"
+        >
+          Cleanup
+        </button>
       </div>
 
       {/* Input */}
