@@ -1,0 +1,37 @@
+# Magic Table - Voice-Controlled Object Retrieval System
+# Python 3.10+ recommended
+
+# Core ML/Vision
+torch>=2.2
+torchvision
+transformers>=4.36.0
+
+# Computer Vision
+opencv-python>=4.8.0
+pillow>=10.0.0
+numpy>=1.24.0
+
+# Speech Recognition
+SpeechRecognition>=3.10.0
+pyaudio>=0.2.14  # Required for microphone input
+
+# Gemini NLP (natural language command parsing)
+google-genai>=1.0.0
+python-dotenv>=1.0.0
+
+# ElevenLabs TTS (spoken responses in conversation mode)
+elevenlabs>=1.0.0
+
+# Web API server (remote command interface)
+flask>=3.0.0
+flask-cors>=4.0.0
+
+# Serial Communication (Arduino/GRBL)
+pyserial>=3.5
+
+# Optional: Text-to-Speech feedback
+# pyttsx3>=2.90  # Uncomment for TTS
+
+# Development/Testing
+# pytest>=7.0.0
+# black>=23.0.0
