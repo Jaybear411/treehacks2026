@@ -1,8 +1,11 @@
 """
 Web Server - REST API for remote command control of the Magic Table.
 
-Runs alongside the main application and accepts text commands
-from the Next.js web interface (or any HTTP client).
+Runs alongside the main application (enabled by default) and accepts
+text commands from the Next.js web interface (or any HTTP client).
+Web commands trigger the same audio feedback and display updates as
+local voice commands — the system behaves identically regardless of
+whether the command came from voice or the web.
 
 Endpoints:
   POST /api/command  - Process a text command (same as voice pipeline)
@@ -13,11 +16,12 @@ Usage:
   # Standalone (no hardware, NLP only):
   python web_server.py
 
-  # Integrated with main.py:
-  python main.py --web
+  # Integrated with main.py (web server starts automatically):
+  python main.py
 """
 
 import os
+import subprocess
 import sys
 import threading
 import time
@@ -46,6 +50,39 @@ _nlp_controller = None       # NLPVoiceController (Gemini NLP)
 
 # Chat history for web sessions (simple in-memory list)
 _chat_history: list[dict] = []
+
+# Audio file directory (same as main.py)
+_SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+
+
+def _audio_path(filename: str) -> str:
+    """Return absolute path to an audio file in the project root."""
+    return os.path.join(_SCRIPT_DIR, filename)
+
+
+def _play_audio_nonblocking(filepath: str):
+    """Play an mp3 file in the background (macOS afplay). Safe to call from any thread."""
+    if not os.path.exists(filepath):
+        return
+    try:
+        subprocess.Popen(
+            ["afplay", filepath],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+    except Exception:
+        pass
+
+
+def _try_force_display(mt):
+    """Attempt to refresh the OpenCV display from the web thread.
+
+    This is best-effort — OpenCV GUI calls must happen on the main thread,
+    so we just update the status message and let the main loop pick it up
+    on its next iteration (typically within ~33 ms at 30 fps).
+    """
+    # The main loop reads _status_message every frame, so just setting it
+    # (done by the caller) is enough to update the on-screen overlay.
 
 
 def create_app(magic_table=None):
@@ -124,12 +161,19 @@ def handle_command():
     # ── 1. Extract object name via Gemini ────────────────────────────────
     result = _nlp_controller.extract_object_name(text)
 
-    # ── 2. Handle goodbye ────────────────────────────────────────────────
+    # ── 2. Handle special intents ────────────────────────────────────────
     from nlp_voice import NLPVoiceController
+
+    if result == NLPVoiceController.CLEANUP:
+        # Delegate to the cleanup endpoint logic
+        return _run_cleanup(source="command")
 
     if result == NLPVoiceController.GOODBYE:
         reply = "Goodbye! Happy to help anytime."
         _chat_history.append({"role": "assistant", "text": reply})
+        _play_audio_nonblocking(_audio_path("happytohelp.mp3"))
+        if _magic_table:
+            _magic_table._status_message = "Goodbye! Happy to help."
         return jsonify({"status": "goodbye", "reply": reply})
 
     # ── 3. No object extracted → fall back to conversation ───────────────
@@ -150,9 +194,13 @@ def handle_command():
         "action": "fetch",
     }
 
+    # Play acknowledgment audio (same as voice pipeline)
+    _play_audio_nonblocking(_audio_path("yesrightaway.mp3"))
+
     # If the full system is running, do VLM detection + gantry move
     if _magic_table and _magic_table.tracker:
-        _magic_table._status_message = f"[WEB] Scanning for '{object_name}'..."
+        _magic_table._status_message = f"Scanning for '{object_name}'..."
+        _try_force_display(_magic_table)
 
         detected = _magic_table.tracker.run_detection(target_label=object_name)
 
@@ -186,9 +234,17 @@ def handle_command():
             )
             if response_data.get("delivered"):
                 reply += " Delivered to pickup zone!"
+
+            # Update local display
+            _magic_table._status_message = (
+                f"Found '{object_name}' at ({phys_x:.0f}, {phys_y:.0f}) mm "
+                f"| conf {obj.confidence:.0%}"
+            )
+            _magic_table._last_result = (object_name, px, py)
         else:
             response_data["found"] = False
             reply = f"I looked for '{object_name}' but couldn't find it on the table."
+            _magic_table._status_message = f"'{object_name}' not found on table."
     else:
         # No tracker — just acknowledge the parsed command
         reply = (
@@ -200,6 +256,68 @@ def handle_command():
     response_data["reply"] = reply
     _chat_history.append({"role": "assistant", "text": reply})
     return jsonify(response_data)
+
+
+# ── Cleanup mode ─────────────────────────────────────────────────────────────
+
+def _run_cleanup(source: str = "button"):
+    """
+    Shared cleanup logic used by both /api/cleanup and the 'clean up' voice
+    command detected inside /api/command.
+
+    Args:
+        source: "button" or "command" — just for logging/reply text.
+
+    Returns:
+        A Flask JSON response.
+    """
+    if not _magic_table or not _magic_table.tracker:
+        msg = (
+            "Cleanup understood, but hardware/tracker isn't connected. "
+            "Cannot run cleanup right now."
+        )
+        _chat_history.append({"role": "assistant", "text": msg})
+        return jsonify({"status": "no_hardware", "reply": msg})
+
+    if not _nlp_controller:
+        msg = "NLP controller not initialised — check GEMINI_API_KEY"
+        _chat_history.append({"role": "assistant", "text": msg})
+        return jsonify({"error": msg}), 503
+
+    # Play acknowledgment audio
+    _play_audio_nonblocking(_audio_path("yesrightaway.mp3"))
+
+    # Run the full cleanup pipeline (blocking — may take a while)
+    _magic_table.cleanup_pipeline()
+
+    status_msg = getattr(_magic_table, "_status_message", "Cleanup finished.")
+    reply = f"Cleanup complete. {status_msg}"
+    _chat_history.append({"role": "assistant", "text": reply})
+
+    return jsonify({
+        "status": "cleanup_done",
+        "reply": reply,
+        "triggered_by": source,
+    })
+
+
+@app.route("/api/cleanup", methods=["POST"])
+def handle_cleanup():
+    """
+    Trigger cleanup mode — detect all objects and consolidate them to one side.
+
+    No request body required (just POST to trigger).
+    Optionally accepts: {"text": "..."} which is logged but otherwise ignored.
+
+    Response: {"status": "cleanup_done", "reply": "..."}
+    """
+    data = request.get_json(silent=True)
+    if data and data.get("text"):
+        _chat_history.append({"role": "user", "text": data["text"]})
+    else:
+        _chat_history.append({"role": "user", "text": "[Cleanup button pressed]"})
+
+    return _run_cleanup(source="button")
 
 
 # ── Conversation mode ────────────────────────────────────────────────────────
@@ -269,6 +387,7 @@ def start_web_server(magic_table=None, host="0.0.0.0", port=5050):
     print(f"\n{'=' * 50}")
     print(f"  Web API server running on http://{host}:{port}")
     print(f"    POST /api/command  — send text commands")
+    print(f"    POST /api/cleanup  — trigger cleanup mode")
     print(f"    POST /api/chat     — chat with Jarvis")
     print(f"    GET  /api/status   — system status")
     print(f"{'=' * 50}\n")

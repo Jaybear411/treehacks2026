@@ -161,6 +161,9 @@ class NLPVoiceController:
     # Sentinel value returned when the user says goodbye
     GOODBYE = "GOODBYE"
 
+    # Sentinel value returned when the user requests cleanup mode
+    CLEANUP = "CLEANUP"
+
     def extract_object_name(self, text: str) -> Optional[str]:
         """
         Use Gemini to extract the object name from a natural language command.
@@ -168,12 +171,21 @@ class NLPVoiceController:
         If the user is saying goodbye / ending the session, returns
         NLPVoiceController.GOODBYE instead of an object name.
 
+        If the user says "clean up" (or similar), returns
+        NLPVoiceController.CLEANUP instead of an object name.
+
         Args:
             text: Transcribed voice command
 
         Returns:
-            The extracted object name in lowercase, "GOODBYE", or None.
+            The extracted object name in lowercase, "GOODBYE", "CLEANUP", or None.
         """
+        # Quick check for cleanup intent before hitting Gemini
+        text_lower = text.lower()
+        if "clean up" in text_lower or "cleanup" in text_lower or "clean it up" in text_lower:
+            print(f"Detected cleanup intent in: '{text}'")
+            return self.CLEANUP
+
         prompt = (
             "You are a voice command parser for a robotic object retrieval system. "
             "The user speaks a command to fetch an object from a table.\n\n"
@@ -190,6 +202,7 @@ class NLPVoiceController:
             "  'I need my glasses' -> glasses\n"
             "  'Jarvis, where are my AirPods' -> airpods\n"
             "  'get the remote control' -> remote control\n"
+            "  'get grandma the red pill bottle' -> red pull bottle\n"
             "  'goodbye' -> GOODBYE\n"
             "  'thanks Jarvis, that will be all' -> GOODBYE\n"
             "  'see you later' -> GOODBYE\n"
@@ -222,6 +235,91 @@ class NLPVoiceController:
         except Exception as e:
             print(f"Gemini error: {e}")
             return None
+
+    def scan_table_objects(self, frame) -> list[str]:
+        """
+        Use Gemini Vision to list all objects visible on the table.
+
+        Sends a camera frame to Gemini and asks it to return a JSON array
+        of object names.  The table itself and permanent fixtures are
+        excluded.
+
+        Args:
+            frame: A BGR numpy array (OpenCV frame) from the overhead camera.
+
+        Returns:
+            A list of object name strings (lowercased), e.g.
+            ["sunglasses case", "cup", "remote control", "keys"].
+            Returns an empty list on failure.
+        """
+        import json
+
+        import cv2
+        from google.genai import types
+
+        # Encode frame as JPEG bytes
+        success, buffer = cv2.imencode(".jpg", frame)
+        if not success:
+            print("scan_table_objects: failed to encode frame")
+            return []
+        image_bytes = buffer.tobytes()
+
+        prompt = (
+            "You are a vision system for a robotic table. "
+            "Look at this overhead image of a tabletop and list ALL distinct, "
+            "movable objects you can see on the table surface.\n\n"
+            "RULES:\n"
+            "- Return ONLY a JSON array of short object names.\n"
+            "- Exclude the table itself, the background, and any permanent "
+            "fixtures (legs, frame, gantry rails).\n"
+            "- Each name should be a simple noun phrase in lowercase "
+            '(e.g. "sunglasses case", "cup", "remote control").\n'
+            "- If you see no objects, return an empty array: []\n\n"
+            'Example response: ["sunglasses case", "cup", "remote control", "keys"]\n'
+            "Response:"
+        )
+
+        try:
+            start = time.time()
+            response = self._client.models.generate_content(
+                model=GEMINI.model_name,
+                contents=[
+                    types.Part.from_bytes(
+                        data=image_bytes, mime_type="image/jpeg"
+                    ),
+                    prompt,
+                ],
+            )
+            elapsed = time.time() - start
+
+            raw = response.text.strip()
+            print(f"Gemini Vision scan ({elapsed:.2f}s): {raw}")
+
+            # Strip markdown code fences if present
+            if raw.startswith("```"):
+                raw = raw.split("\n", 1)[1] if "\n" in raw else raw[3:]
+                raw = raw.rsplit("```", 1)[0]
+
+            objects = json.loads(raw)
+
+            if not isinstance(objects, list):
+                print(f"scan_table_objects: expected list, got {type(objects)}")
+                return []
+
+            cleaned = [
+                obj.strip().lower()
+                for obj in objects
+                if isinstance(obj, str) and obj.strip()
+            ]
+            print(f"Detected {len(cleaned)} objects: {cleaned}")
+            return cleaned
+
+        except json.JSONDecodeError as e:
+            print(f"scan_table_objects JSON parse error: {e}")
+            return []
+        except Exception as e:
+            print(f"scan_table_objects error: {e}")
+            return []
 
     def converse(self, text: str) -> Optional[str]:
         """

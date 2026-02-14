@@ -61,12 +61,12 @@ def play_audio(filepath: str, block: bool = False):
     except Exception as e:
         print(f"Audio playback error: {e}")
 
-from config import GANTRY, GRBL, DETECTION, print_config
+from config import GANTRY, GRBL, CAMERA, DETECTION, print_config
 from grbl_controller import GRBLController
 from object_tracker import ObjectTracker, TrackedObject
 from voice_control import VoiceController, VoiceCommand, CommandType
 from nlp_voice import NLPVoiceController
-from calibration import CoordinateTransformer, CalibrationWizard
+from calibration import CoordinateTransformer, CalibrationWizard, AutoCalibrator
 
 
 class MagicTable:
@@ -132,11 +132,39 @@ class MagicTable:
         print("Loading calibration...")
         self.transformer = CoordinateTransformer()
         if not self.transformer.load_calibration():
-            print("No calibration found. Using default linear mapping.")
-            print("Run 'python main.py --calibrate' for accurate calibration.\n")
-            # Use quick calibration as fallback
-            wizard = CalibrationWizard()
-            self.transformer = wizard.quick_calibrate()
+            print("No saved calibration found.")
+            print("Attempting auto-calibration from blue markers...")
+            
+            # Try to auto-calibrate from a live camera frame
+            auto = AutoCalibrator()
+            cap = cv2.VideoCapture(CAMERA.index)
+            if cap.isOpened():
+                cap.set(cv2.CAP_PROP_FRAME_WIDTH, CAMERA.width)
+                cap.set(cv2.CAP_PROP_FRAME_HEIGHT, CAMERA.height)
+                # Grab a few frames to let the camera stabilize
+                for _ in range(10):
+                    cap.read()
+                ret, frame = cap.read()
+                cap.release()
+                if ret:
+                    result = auto.run_headless(frame)
+                    if result is not None:
+                        self.transformer = result
+                        print("Auto-calibration from markers succeeded!\n")
+                    else:
+                        print("Auto-calibration failed (markers not found).")
+                        print("Falling back to default linear mapping.")
+                        print("Run 'python main.py --calibrate' to calibrate.\n")
+                        wizard = CalibrationWizard()
+                        self.transformer = wizard.quick_calibrate()
+                else:
+                    print("Could not capture frame for auto-calibration.")
+                    wizard = CalibrationWizard()
+                    self.transformer = wizard.quick_calibrate()
+            else:
+                print("Could not open camera for auto-calibration.")
+                wizard = CalibrationWizard()
+                self.transformer = wizard.quick_calibrate()
         
         # Initialize object tracker
         print("\nInitializing object tracker...")
@@ -174,7 +202,9 @@ class MagicTable:
         print("\nKeyboard controls:")
         print("  SPACE - Push-to-talk: say what object to find")
         print("          e.g. 'Hey Jarvis, get me the pill bottle'")
+        print("          or   'Clean up this table'")
         print("  C     - Conversation mode: chat with Jarvis")
+        print("  L     - Cleanup mode: move all objects to one side")
         if self.target_label:
             print(f"  V     - Run VLM detection for '{self.target_label}'")
         print("  H     - Return magnet to home")
@@ -344,6 +374,13 @@ class MagicTable:
             self._force_display_update()
             return
 
+        # Check if the user requested cleanup
+        if result == NLPVoiceController.CLEANUP:
+            print("User requested cleanup.")
+            play_audio(AUDIO_YES_RIGHT_AWAY)
+            self.cleanup_pipeline()
+            return
+
         object_name = result
 
         # User asked for an object — acknowledge with "Yes, right away"
@@ -377,6 +414,121 @@ class MagicTable:
         else:
             self._last_result = None
             self._status_message = f"'{object_name}' not found on table. Press SPACE to try again."
+
+    def cleanup_pipeline(self):
+        """
+        Cleanup mode — consolidate all scattered objects to one side of the table.
+
+        Steps:
+        1. Capture scene, use Gemini Vision to list every object on the table.
+        2. For each object, run VLM detection to get pixel coordinates.
+        3. Convert to physical coords; skip if already on the "clean" side.
+        4. Drag the object to the cleanup edge (preserving its Y position).
+        5. Return home when finished.
+        """
+        if self._busy:
+            print("System busy — please wait")
+            return
+
+        self._busy = True
+        self._status_message = "CLEANUP: Scanning table..."
+        self._force_display_update()
+
+        try:
+            # ── Step 1: Capture scene & identify objects via Gemini Vision ──
+            frame = self.tracker.get_frame()
+            if frame is None:
+                frame = self.tracker.capture_frame()
+            if frame is None:
+                self._status_message = "Cleanup failed: no camera frame"
+                return
+
+            if not self.nlp_voice:
+                self._status_message = "Cleanup requires Gemini (check API key)"
+                return
+
+            objects = self.nlp_voice.scan_table_objects(frame)
+
+            if not objects:
+                self._status_message = "Cleanup: no objects found on table"
+                return
+
+            print(f"\nCLEANUP: Found {len(objects)} objects: {objects}")
+            self._status_message = f"CLEANUP: Found {len(objects)} objects — moving..."
+            self._force_display_update()
+
+            # ── Steps 2-4: Process each object sequentially ────────────
+            moved_count = 0
+            for i, obj_name in enumerate(objects):
+                tag = f"[{i + 1}/{len(objects)}]"
+                self._status_message = f"CLEANUP {tag}: Detecting '{obj_name}'..."
+                self._force_display_update()
+
+                # Re-capture a fresh frame before each detection so the
+                # tracker has an up-to-date view (previous object may have
+                # moved, changing the scene).
+                self.tracker.capture_frame()
+
+                detected = self.tracker.run_detection(target_label=obj_name)
+                if not detected:
+                    print(f"  {tag} Could not find '{obj_name}' — skipping")
+                    continue
+
+                obj = detected[0]
+                px, py = obj.center_x, obj.center_y
+
+                # Check if the object is already on the clean side
+                frame_width = CAMERA.width
+                threshold_px = frame_width * GANTRY.cleanup_threshold_fraction
+                if px >= threshold_px:
+                    print(f"  {tag} '{obj_name}' already at cleanup edge — skipping")
+                    continue
+
+                # Convert to physical coordinates
+                phys_x, phys_y = self._pixel_to_physical(px, py)
+
+                # Destination: cleanup edge, preserve Y
+                dest_x = GANTRY.cleanup_x_mm
+                dest_y = phys_y
+
+                self._status_message = (
+                    f"CLEANUP {tag}: Moving '{obj_name}' → ({dest_x:.0f}, {dest_y:.0f})"
+                )
+                self._force_display_update()
+
+                print(
+                    f"  {tag} Moving '{obj_name}' from "
+                    f"({phys_x:.0f}, {phys_y:.0f}) to ({dest_x:.0f}, {dest_y:.0f})"
+                )
+
+                if self.motor and self.motor.connected:
+                    success = self.motor.drag_object_to(
+                        from_x=phys_x,
+                        from_y=phys_y,
+                        to_x=dest_x,
+                        to_y=dest_y,
+                    )
+                    if success:
+                        moved_count += 1
+                    else:
+                        print(f"  {tag} Motor failed for '{obj_name}'")
+                else:
+                    # Simulation mode
+                    print(f"  {tag} [SIM] Would move '{obj_name}'")
+                    moved_count += 1
+                    time.sleep(0.5)
+
+            # ── Step 5: Return home ────────────────────────────────────
+            if self.motor and self.motor.connected:
+                self.motor.go_home()
+
+            self._status_message = (
+                f"CLEANUP DONE: Moved {moved_count}/{len(objects)} objects to edge"
+            )
+            print(f"\nCLEANUP COMPLETE — moved {moved_count}/{len(objects)} objects\n")
+
+        finally:
+            self._busy = False
 
     def conversation_pipeline(self):
         """
@@ -454,7 +606,7 @@ class MagicTable:
                 
                 # Draw instructions at top
                 h, w = display.shape[:2]
-                cv2.putText(display, "SPACE: fetch object | C: chat | Q: quit", (10, 30),
+                cv2.putText(display, "SPACE: fetch | C: chat | L: cleanup | Q: quit", (10, 30),
                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
                 
                 # Draw object list if any detected
@@ -509,6 +661,10 @@ class MagicTable:
                 elif key == ord('c'):
                     # C: Conversation mode
                     self.conversation_pipeline()
+                elif key == ord('l'):
+                    # L: Cleanup mode — move all objects to one side
+                    play_audio(AUDIO_YES_RIGHT_AWAY)
+                    self.cleanup_pipeline()
                 elif key == ord('h'):
                     self.go_home()
                 elif key == ord('s'):
@@ -540,22 +696,35 @@ class MagicTable:
             print("Shutdown complete.")
 
 
-def run_calibration():
-    """Run the calibration wizard."""
-    print("Starting calibration wizard...")
+def run_calibration(manual: bool = False):
+    """
+    Run camera calibration.
     
-    # Optionally connect to motor for auto-positioning
-    motor = GRBLController()
-    if motor.connect():
-        motor.soft_home()
+    By default uses automatic blue-marker detection.
+    Pass manual=True to use the old interactive click wizard.
+    """
+    if manual:
+        print("Starting manual calibration wizard...")
+        motor = GRBLController()
+        if motor.connect():
+            motor.soft_home()
+        else:
+            motor = None
+        
+        wizard = CalibrationWizard()
+        wizard.run_wizard(grbl_controller=motor)
+        
+        if motor:
+            motor.disconnect()
     else:
-        motor = None
-    
-    wizard = CalibrationWizard()
-    transformer = wizard.run_wizard(grbl_controller=motor)
-    
-    if motor:
-        motor.disconnect()
+        print("Starting auto-calibration (blue marker detection)...")
+        calibrator = AutoCalibrator()
+        result = calibrator.run(show_preview=True)
+        if result is None:
+            print("\nAuto-calibration failed. You can try:")
+            print("  python main.py --calibrate          (auto, try again)")
+            print("  python main.py --calibrate-manual   (interactive click wizard)")
+            return
     
     print("\nCalibration complete!")
     print("You can now run: python main.py")
@@ -579,7 +748,12 @@ def main():
     parser.add_argument(
         "--calibrate",
         action="store_true",
-        help="Run calibration wizard"
+        help="Run auto-calibration (detect 4 blue markers)"
+    )
+    parser.add_argument(
+        "--calibrate-manual",
+        action="store_true",
+        help="Run manual calibration wizard (click corners)"
     )
     parser.add_argument(
         "--test-vision",
@@ -603,9 +777,9 @@ def main():
         help="Object label to detect (e.g. 'keys', 'phone'). Prompted if not given."
     )
     parser.add_argument(
-        "--web",
+        "--no-web",
         action="store_true",
-        help="Start the web API server alongside the main loop (port 5050)"
+        help="Disable the web API server (enabled by default on port 5050)"
     )
     parser.add_argument(
         "--web-port",
@@ -618,7 +792,11 @@ def main():
     
     # Handle special test modes
     if args.calibrate:
-        run_calibration()
+        run_calibration(manual=False)
+        return
+    
+    if args.calibrate_manual:
+        run_calibration(manual=True)
         return
     
     if args.test_vision:
@@ -649,8 +827,8 @@ def main():
     )
     
     if table.initialize():
-        # Optionally start the web API server in a background thread
-        if args.web:
+        # Start the web API server in a background thread (on by default)
+        if not args.no_web:
             from web_server import start_web_server
             start_web_server(magic_table=table, port=args.web_port)
 

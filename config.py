@@ -32,6 +32,15 @@ class GantryConfig:
     home_x_mm: float = 0.0
     home_y_mm: float = 0.0
     
+    # Cleanup zone — where objects are pushed during cleanup mode
+    # Default: right edge of the gantry, preserving each object's Y
+    cleanup_x_mm: float = 380.0
+    
+    # Pixel-space threshold for deciding if an object needs moving.
+    # Objects whose center_x is >= this fraction of frame width are
+    # considered "already at the clean side" and will be skipped.
+    cleanup_threshold_fraction: float = 0.75
+    
     @property
     def min_x(self) -> float:
         return self.margin_mm
@@ -117,6 +126,55 @@ class CalibrationConfig:
 
 
 @dataclass
+class MarkerConfig:
+    """Blue-dot calibration marker detection settings.
+    
+    Place 4 blue markers (tape dots) at the gantry corners.
+    The auto-calibration system detects them via HSV color filtering
+    and maps them to the known physical corner positions.
+    """
+    # HSV range for blue marker detection
+    # Default tuned for blue painter's tape / blue dots under typical lighting
+    # Hue: 90-130 covers most blues (OpenCV hue range is 0-179)
+    hue_low: int = 90
+    hue_high: int = 130
+    sat_low: int = 80
+    sat_high: int = 255
+    val_low: int = 60
+    val_high: int = 255
+    
+    # Contour area filter (pixels^2) — reject noise and overly large blobs
+    min_area: int = 200
+    max_area: int = 50000
+    
+    # Minimum circularity (0.0 - 1.0). Dots should be roughly circular.
+    # Lower this if your markers are irregular shapes.
+    min_circularity: float = 0.3
+    
+    # Gaussian blur kernel size applied before HSV thresholding (must be odd)
+    blur_kernel: int = 5
+    
+    # Number of frames to average for more stable detection
+    detection_frames: int = 5
+    
+    # Physical positions of the 4 markers (mm) — must match your gantry layout.
+    # Order: top-left, top-right, bottom-right, bottom-left (when viewed from camera)
+    # These are at the EDGES of the gantry with a small margin.
+    # NOTE: "top" in camera view = high Y in physical space (camera is overhead)
+    marker_positions_mm: Tuple[
+        Tuple[float, float],
+        Tuple[float, float],
+        Tuple[float, float],
+        Tuple[float, float],
+    ] = (
+        (10.0, 390.0),   # top-left in camera  → physical (margin, height-margin)
+        (390.0, 390.0),  # top-right in camera → physical (width-margin, height-margin)
+        (390.0, 10.0),   # bottom-right        → physical (width-margin, margin)
+        (10.0, 10.0),    # bottom-left         → physical (margin, margin)
+    )
+
+
+@dataclass
 class VoiceConfig:
     """Voice recognition settings."""
     # Wake word (optional - set to None to always listen)
@@ -193,6 +251,7 @@ GANTRY = GantryConfig()
 GRBL = GRBLConfig()
 CAMERA = CameraConfig()
 CALIBRATION = CalibrationConfig()
+MARKER = MarkerConfig()
 VOICE = VoiceConfig()
 DETECTION = DetectionConfig()
 GEMINI = GeminiConfig()
