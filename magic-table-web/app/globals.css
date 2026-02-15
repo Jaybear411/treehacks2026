@@ -1,3 +1,26 @@
 @tailwind base;
 @tailwind components;
 @tailwind utilities;
+
+/* Mobile: prevent iOS/Safari zoom on input focus (requires font-size >= 16px) */
+@layer base {
+  input,
+  select,
+  textarea,
+  [contenteditable="true"] {
+    font-size: 16px !important;
+  }
+}
+
+/* Prevent double-tap zoom on interactive elements; keeps single-tap responsive */
+@layer utilities {
+  @media (hover: none) and (pointer: coarse) {
+    button,
+    a,
+    input,
+    select,
+    textarea {
+      touch-action: manipulation;
+    }
+  }
+}

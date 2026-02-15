@@ -167,6 +167,19 @@ python main.py --calibrate
 
 This walks you through clicking four corners to map camera pixels to physical coordinates.
 
+### Motor Sweep Calibration (recommended for motion accuracy)
+
+```bash
+# Default 4x3 sweep grid (12 points)
+python main.py --calibrate-motor
+
+# Denser grid for higher accuracy
+python main.py --calibrate-motor --cal-grid-x 5 --cal-grid-y 4
+```
+
+The gantry automatically moves across the board. At each stop, click the magnet in the camera view.
+This records many pixel->physical pairs and saves an improved homography in `calibration_data.json`.
+
 ## Voice Commands
 
 | Command | Action |

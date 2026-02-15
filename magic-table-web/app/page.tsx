@@ -39,7 +39,7 @@ export default function LoginPage() {
             setUsername(e.target.value);
             setError("");
           }}
-          className="border border-gray-300 rounded px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-black"
+          className="border border-gray-300 rounded px-3 py-2 text-base focus:outline-none focus:ring-2 focus:ring-black min-h-[44px]"
           autoFocus
         />
 
@@ -48,14 +48,14 @@ export default function LoginPage() {
           placeholder="Server URL"
           value={serverUrl}
           onChange={(e) => setServerUrl(e.target.value)}
-          className="border border-gray-300 rounded px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-black text-gray-500"
+          className="border border-gray-300 rounded px-3 py-2 text-base focus:outline-none focus:ring-2 focus:ring-black text-gray-500 min-h-[44px]"
         />
 
         {error && <p className="text-red-600 text-sm text-center">{error}</p>}
 
         <button
           type="submit"
-          className="bg-black text-white rounded px-4 py-2 text-sm font-medium hover:bg-gray-800 transition-colors"
+          className="bg-black text-white rounded px-4 py-2 text-base font-medium hover:bg-gray-800 transition-colors min-h-[44px]"
         >
           Log in
         </button>

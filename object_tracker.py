@@ -73,13 +73,22 @@ class ObjectTracker:
         # Camera
         self._cap: Optional[cv2.VideoCapture] = None
         self._camera_index = CAMERA.index
-        
+        self._zoom_factor = getattr(CAMERA, "zoom_factor", 1.0) or 1.0
+
+        # Zoom state: after capture_frame(), conversion zoomed -> original uses these
+        self._zoom_x0: Optional[float] = None
+        self._zoom_y0: Optional[float] = None
+        self._zoom_crop_w: Optional[float] = None
+        self._zoom_crop_h: Optional[float] = None
+        self._zoom_w: Optional[float] = None
+        self._zoom_h: Optional[float] = None
+
         # Tracked objects (persist until next detection)
         self._objects: Dict[str, TrackedObject] = {}
-        
+
         # Last frame
         self._last_frame: Optional[np.ndarray] = None
-        
+
         # Detection status
         self._last_detection_time: Optional[float] = None
         self._detection_in_progress = False
@@ -121,20 +130,68 @@ class ObjectTracker:
         
         Returns True if successful.
         """
-        camera_index = camera_index or self._camera_index
+        camera_index = camera_index if camera_index is not None else self._camera_index
         
-        # Load model
-        self._load_detector()
-        
-        # Open camera
-        self._cap = cv2.VideoCapture(camera_index)
+        # Open camera FIRST — on macOS the device index can shift if we wait
+        # (Continuity Camera / iPhone can claim index 0 after a delay).
+        # We also immediately read frames before model load so AVFoundation
+        # starts streaming right away and doesn't stall.
+        print(f"Opening camera {camera_index}...")
+        # Use the macOS backend explicitly for more predictable behavior.
+        self._cap = cv2.VideoCapture(camera_index, cv2.CAP_AVFOUNDATION)
+
+        # If the early open didn't work, retry a few times
         if not self._cap.isOpened():
+            for attempt in range(3):
+                print(f"Camera not ready, retrying ({attempt + 1}/3)...")
+                time.sleep(1)
+                self._cap = cv2.VideoCapture(camera_index, cv2.CAP_AVFOUNDATION)
+                if self._cap.isOpened():
+                    break
+        
+        if not self._cap or not self._cap.isOpened():
             print(f"ERROR: Could not open camera {camera_index}")
             return False
         
-        # Set resolution if supported
+        # Set resolution
         self._cap.set(cv2.CAP_PROP_FRAME_WIDTH, CAMERA.width)
         self._cap.set(cv2.CAP_PROP_FRAME_HEIGHT, CAMERA.height)
+
+        # Warm-up/read with retries. Some cameras report "opened" before
+        # frames are actually available.
+        frame = None
+        for _ in range(30):
+            ret, candidate = self._cap.read()
+            if ret and candidate is not None:
+                frame = candidate
+                break
+            time.sleep(0.1)
+
+        # Controlled fallback: one reopen attempt on the SAME index/backend.
+        if frame is None:
+            print("Camera opened but no frames yet; reopening once...")
+            self._cap.release()
+            time.sleep(0.5)
+            self._cap = cv2.VideoCapture(camera_index, cv2.CAP_AVFOUNDATION)
+            if self._cap and self._cap.isOpened():
+                self._cap.set(cv2.CAP_PROP_FRAME_WIDTH, CAMERA.width)
+                self._cap.set(cv2.CAP_PROP_FRAME_HEIGHT, CAMERA.height)
+                for _ in range(30):
+                    ret, candidate = self._cap.read()
+                    if ret and candidate is not None:
+                        frame = candidate
+                        break
+                    time.sleep(0.1)
+
+        if frame is None:
+            print(f"ERROR: Camera {camera_index} opened but cannot read frames")
+            self._cap.release()
+            return False
+
+        self._last_frame = self._apply_zoom(frame)
+
+        # Load model after camera stream is confirmed healthy.
+        self._load_detector()
         
         print(f"Camera opened: {camera_index}")
         actual_w = int(self._cap.get(cv2.CAP_PROP_FRAME_WIDTH))
@@ -150,21 +207,46 @@ class ObjectTracker:
             self._cap = None
         print("Camera stopped.")
     
+    def _apply_zoom(self, frame: np.ndarray) -> np.ndarray:
+        """Apply digital zoom (center crop + resize) so all processing sees zoomed image."""
+        h, w = frame.shape[:2]
+        if self._zoom_factor <= 1.0:
+            self._zoom_x0 = 0.0
+            self._zoom_y0 = 0.0
+            self._zoom_crop_w = float(w)
+            self._zoom_crop_h = float(h)
+            self._zoom_w = float(w)
+            self._zoom_h = float(h)
+            return frame
+        crop_w = w / self._zoom_factor
+        crop_h = h / self._zoom_factor
+        x0 = (w - crop_w) / 2
+        y0 = (h - crop_h) / 2
+        cropped = frame[int(y0) : int(y0 + crop_h), int(x0) : int(x0 + crop_w)]
+        zoomed = cv2.resize(cropped, (w, h))
+        self._zoom_x0 = x0
+        self._zoom_y0 = y0
+        self._zoom_crop_w = crop_w
+        self._zoom_crop_h = crop_h
+        self._zoom_w = float(w)
+        self._zoom_h = float(h)
+        return zoomed
+
     def capture_frame(self) -> Optional[np.ndarray]:
         """
         Capture a frame from the camera (NO detection).
-        
-        Returns the frame (or None if capture failed).
+        Digital zoom is applied before returning so detection/display see zoomed image.
+        Reported object positions are converted back to original camera coordinates.
         """
         if not self._cap or not self._cap.isOpened():
             return None
-        
+
         ret, frame = self._cap.read()
         if not ret:
             return None
-        
-        self._last_frame = frame
-        return frame
+
+        self._last_frame = self._apply_zoom(frame)
+        return self._last_frame
     
     def run_detection(self, target_label: str = None) -> List[TrackedObject]:
         """
@@ -304,10 +386,10 @@ class ObjectTracker:
             
             cx = (x1 + x2) / 2.0
             cy = (y1 + y2) / 2.0
-            
+
             print(f"  Extracted (scaled to original): ({x1:.1f}, {y1:.1f}) -> ({x2:.1f}, {y2:.1f})")
             print(f"  Center: ({cx:.1f}, {cy:.1f})")
-            
+
             obj = TrackedObject(
                 label=label,
                 center_x=cx,

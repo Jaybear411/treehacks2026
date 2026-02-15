@@ -46,7 +46,7 @@ CORS(app)
 # References to live system components (set via create_app or start_web_server)
 # ---------------------------------------------------------------------------
 _magic_table = None          # MagicTable instance (full system)
-_nlp_controller = None       # NLPVoiceController (Gemini NLP)
+_nlp_controller = None       # NLPVoiceController (Claude NLP + OpenAI Vision)
 
 # Chat history for web sessions (simple in-memory list)
 _chat_history: list[dict] = []
@@ -90,7 +90,7 @@ def create_app(magic_table=None):
     Configure the Flask app with a reference to the running MagicTable.
 
     If magic_table is None the server starts in "standalone" mode —
-    it can still parse commands via Gemini but won't drive hardware.
+    it can still parse commands via Claude but won't drive hardware.
     """
     global _magic_table, _nlp_controller
 
@@ -99,7 +99,7 @@ def create_app(magic_table=None):
     if magic_table and magic_table.nlp_voice:
         _nlp_controller = magic_table.nlp_voice
     elif _nlp_controller is None:
-        # Standalone mode — spin up an NLPVoiceController just for Gemini
+        # Standalone mode — spin up an NLPVoiceController for Claude/OpenAI
         try:
             from nlp_voice import NLPVoiceController
             _nlp_controller = NLPVoiceController()
@@ -154,11 +154,11 @@ def handle_command():
     _chat_history.append({"role": "user", "text": text})
 
     if not _nlp_controller:
-        msg = "NLP controller not initialised — check GEMINI_API_KEY"
+        msg = "NLP controller not initialised — check ANTHROPIC_API_KEY"
         _chat_history.append({"role": "assistant", "text": msg})
         return jsonify({"error": msg}), 503
 
-    # ── 1. Extract object name via Gemini ────────────────────────────────
+    # ── 1. Extract object name via Claude ────────────────────────────────
     result = _nlp_controller.extract_object_name(text)
 
     # ── 2. Handle special intents ────────────────────────────────────────
@@ -167,6 +167,10 @@ def handle_command():
     if result == NLPVoiceController.CLEANUP:
         # Delegate to the cleanup endpoint logic
         return _run_cleanup(source="command")
+
+    if result == NLPVoiceController.DESCRIBE_TABLE:
+        # Delegate to the describe-table logic
+        return _run_describe_table(source="command")
 
     if result == NLPVoiceController.GOODBYE:
         reply = "Goodbye! Happy to help anytime."
@@ -280,7 +284,7 @@ def _run_cleanup(source: str = "button"):
         return jsonify({"status": "no_hardware", "reply": msg})
 
     if not _nlp_controller:
-        msg = "NLP controller not initialised — check GEMINI_API_KEY"
+        msg = "NLP controller not initialised — check ANTHROPIC_API_KEY"
         _chat_history.append({"role": "assistant", "text": msg})
         return jsonify({"error": msg}), 503
 
@@ -318,6 +322,80 @@ def handle_cleanup():
         _chat_history.append({"role": "user", "text": "[Cleanup button pressed]"})
 
     return _run_cleanup(source="button")
+
+
+# ── Describe table mode ──────────────────────────────────────────────────────
+
+def _run_describe_table(source: str = "button"):
+    """
+    Shared describe-table logic used by /api/describe and the voice intent
+    detected inside /api/command.
+
+    Captures the current frame, sends it to OpenAI Vision, and returns a
+    natural-language description of every object on the table.
+
+    Args:
+        source: "button" or "command" — for logging.
+
+    Returns:
+        A Flask JSON response.
+    """
+    from nlp_voice import NLPVoiceController
+
+    if not _magic_table or not _magic_table.tracker:
+        msg = (
+            "I'd love to look, but the camera/tracker isn't connected right now."
+        )
+        _chat_history.append({"role": "assistant", "text": msg})
+        return jsonify({"status": "no_hardware", "reply": msg})
+
+    if not _nlp_controller:
+        msg = "NLP controller not initialised — check ANTHROPIC_API_KEY"
+        _chat_history.append({"role": "assistant", "text": msg})
+        return jsonify({"error": msg}), 503
+
+    # Grab the latest camera frame
+    frame = _magic_table.tracker.get_frame()
+    if frame is None:
+        frame = _magic_table.tracker.capture_frame()
+    if frame is None:
+        msg = "Couldn't capture a frame from the camera."
+        _chat_history.append({"role": "assistant", "text": msg})
+        return jsonify({"status": "error", "reply": msg})
+
+    objects = _nlp_controller.scan_table_objects(frame)
+    sentence = NLPVoiceController.objects_to_sentence(objects)
+
+    # Update the local OpenCV display
+    _magic_table._status_message = sentence
+
+    _chat_history.append({"role": "assistant", "text": sentence})
+
+    return jsonify({
+        "status": "success",
+        "objects": objects,
+        "reply": sentence,
+        "triggered_by": source,
+    })
+
+
+@app.route("/api/describe", methods=["POST"])
+def handle_describe():
+    """
+    Tell me what's on the table — scan the scene and return the object list.
+
+    No request body required (just POST to trigger).
+    Optionally accepts: {"text": "..."} which is logged but otherwise ignored.
+
+    Response: {"status": "success", "objects": [...], "reply": "I can see ..."}
+    """
+    data = request.get_json(silent=True)
+    if data and data.get("text"):
+        _chat_history.append({"role": "user", "text": data["text"]})
+    else:
+        _chat_history.append({"role": "user", "text": "[Describe table button pressed]"})
+
+    return _run_describe_table(source="button")
 
 
 # ── Conversation mode ────────────────────────────────────────────────────────
@@ -387,6 +465,7 @@ def start_web_server(magic_table=None, host="0.0.0.0", port=5050):
     print(f"\n{'=' * 50}")
     print(f"  Web API server running on http://{host}:{port}")
     print(f"    POST /api/command  — send text commands")
+    print(f"    POST /api/describe — what's on the table?")
     print(f"    POST /api/cleanup  — trigger cleanup mode")
     print(f"    POST /api/chat     — chat with Jarvis")
     print(f"    GET  /api/status   — system status")

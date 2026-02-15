@@ -401,6 +401,156 @@ class CalibrationWizard:
         return self.transformer
 
 
+class MotorSweepCalibrator:
+    """
+    Motor-driven calibration that sweeps across the board in a grid.
+
+    Workflow:
+    1. Gantry auto-moves to each known physical point.
+    2. User clicks the magnet location in camera view.
+    3. System computes and saves a homography using all recorded points.
+    """
+
+    def __init__(self, camera_index: int = None):
+        self.camera_index = camera_index if camera_index is not None else CAMERA.index
+        self.transformer = CoordinateTransformer()
+        self._clicked_point: Optional[Tuple[int, int]] = None
+
+    def _mouse_callback(self, event, x, y, flags, param):
+        """Mouse click handler for calibration capture."""
+        if event == cv2.EVENT_LBUTTONDOWN:
+            self._clicked_point = (x, y)
+
+    @staticmethod
+    def _generate_grid_points(
+        grid_cols: int,
+        grid_rows: int,
+    ) -> List[Tuple[float, float]]:
+        """
+        Generate serpentine traversal points within gantry limits.
+        """
+        cols = max(2, grid_cols)
+        rows = max(2, grid_rows)
+        min_x, max_x = GANTRY.min_x, GANTRY.max_x
+        min_y, max_y = GANTRY.min_y, GANTRY.max_y
+
+        xs = np.linspace(min_x, max_x, cols).tolist()
+        ys = np.linspace(min_y, max_y, rows).tolist()
+
+        points: List[Tuple[float, float]] = []
+        for r, y in enumerate(ys):
+            row_xs = xs if (r % 2 == 0) else list(reversed(xs))
+            for x in row_xs:
+                points.append((float(x), float(y)))
+        return points
+
+    def run(
+        self,
+        grbl_controller,
+        grid_cols: int = 4,
+        grid_rows: int = 3,
+        settle_seconds: float = 0.35,
+    ) -> CoordinateTransformer:
+        """
+        Run motor sweep calibration using a connected GRBL controller.
+        """
+        if grbl_controller is None or not grbl_controller.connected:
+            raise RuntimeError("Motor sweep calibration requires a connected GRBL controller.")
+
+        cap = cv2.VideoCapture(self.camera_index)
+        if not cap.isOpened():
+            raise RuntimeError(f"Could not open camera {self.camera_index}")
+
+        cv2.namedWindow("Motor Sweep Calibration")
+        cv2.setMouseCallback("Motor Sweep Calibration", self._mouse_callback)
+
+        points = self._generate_grid_points(grid_cols=grid_cols, grid_rows=grid_rows)
+
+        print("\n" + "=" * 60)
+        print("MOTOR SWEEP CALIBRATION")
+        print("=" * 60)
+        print(f"Grid: {max(2, grid_cols)} x {max(2, grid_rows)} ({len(points)} points)")
+        print("The gantry will move point-to-point. Click the magnet each time.")
+        print("Controls: click = record, 's' = skip point, 'q' = cancel")
+        print("=" * 60 + "\n")
+
+        for idx, (phys_x, phys_y) in enumerate(points, start=1):
+            print(f"[{idx}/{len(points)}] Moving to ({phys_x:.1f}, {phys_y:.1f}) mm...")
+            moved = grbl_controller.move_to(phys_x, phys_y, wait=True)
+            if not moved:
+                print("  Move failed or blocked by limit. Skipping this point.")
+                continue
+
+            # Let vibration settle before clicking.
+            cv2.waitKey(int(max(0.0, settle_seconds) * 1000))
+            self._clicked_point = None
+
+            while True:
+                ret, frame = cap.read()
+                if not ret:
+                    continue
+
+                # Draw overlay
+                cv2.putText(
+                    frame,
+                    f"Point {idx}/{len(points)}  Physical: ({phys_x:.1f}, {phys_y:.1f}) mm",
+                    (10, 30),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.65,
+                    (0, 255, 0),
+                    2,
+                )
+                cv2.putText(
+                    frame,
+                    "Click magnet | 's' skip | 'q' cancel",
+                    (10, 60),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.55,
+                    (255, 255, 255),
+                    1,
+                )
+
+                # Draw already-recorded points
+                for p in self.transformer.calibration_points:
+                    cv2.circle(frame, (int(p.pixel_x), int(p.pixel_y)), 5, (0, 255, 255), -1)
+
+                cv2.imshow("Motor Sweep Calibration", frame)
+                key = cv2.waitKey(1) & 0xFF
+
+                if key == ord("q"):
+                    print("Calibration cancelled by user.")
+                    cap.release()
+                    cv2.destroyAllWindows()
+                    self.transformer.compute_transform()
+                    self.transformer.save_calibration()
+                    return self.transformer
+
+                if key == ord("s"):
+                    print("  Skipped.")
+                    break
+
+                if self._clicked_point is not None:
+                    px, py = self._clicked_point
+                    self.transformer.add_calibration_point(
+                        pixel=(px, py),
+                        physical=(phys_x, phys_y),
+                    )
+                    print(
+                        "  Recorded: "
+                        f"pixel ({px}, {py}) -> physical ({phys_x:.1f}, {phys_y:.1f})"
+                    )
+                    break
+
+        cap.release()
+        cv2.destroyAllWindows()
+
+        print(f"\nCaptured {len(self.transformer.calibration_points)} calibration points.")
+        self.transformer.compute_transform()
+        self.transformer.save_calibration()
+        print("Motor sweep calibration complete.")
+        return self.transformer
+
+
 class AutoCalibrator:
     """
     Automatic calibration using blue marker dots.
@@ -800,6 +950,16 @@ def run_auto_calibration():
     """Run the automatic blue-marker calibration."""
     calibrator = AutoCalibrator()
     return calibrator.run(show_preview=True)
+
+
+def run_motor_sweep_calibration(grbl_controller, grid_cols: int = 4, grid_rows: int = 3):
+    """Run motor-driven grid sweep calibration."""
+    calibrator = MotorSweepCalibrator()
+    return calibrator.run(
+        grbl_controller=grbl_controller,
+        grid_cols=grid_cols,
+        grid_rows=grid_rows,
+    )
 
 
 if __name__ == "__main__":

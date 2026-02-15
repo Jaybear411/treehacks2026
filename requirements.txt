@@ -14,10 +14,14 @@ numpy>=1.24.0
 # Speech Recognition
 SpeechRecognition>=3.10.0
 pyaudio>=0.2.14  # Required for microphone input
+pynput>=1.7.7    # Key hold detection for push-to-talk
 
-# Gemini NLP (natural language command parsing)
-google-genai>=1.0.0
+# OpenAI (vision tasks — scan_table_objects)
+openai>=1.0.0
 python-dotenv>=1.0.0
+
+# Anthropic Claude (text NLP — object extraction, conversation)
+anthropic>=0.39.0
 
 # ElevenLabs TTS (spoken responses in conversation mode)
 elevenlabs>=1.0.0

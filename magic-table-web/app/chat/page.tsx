@@ -121,7 +121,7 @@ export default function ChatPage() {
         <h1 className="text-lg font-semibold">Magic Table</h1>
         <button
           onClick={handleLogout}
-          className="text-xs text-gray-400 hover:text-black transition-colors"
+          className="text-sm text-gray-400 hover:text-black transition-colors min-h-[44px] min-w-[44px] px-2 -mr-2"
         >
           Log out
         </button>
@@ -173,14 +173,14 @@ export default function ChatPage() {
             handleAction("/api/describe", "What's on the table?")
           }
           disabled={loading}
-          className="flex-1 border border-gray-300 rounded-lg px-3 py-2 text-sm font-medium text-gray-700 hover:bg-gray-50 active:bg-gray-100 transition-colors disabled:opacity-30"
+          className="flex-1 border border-gray-300 rounded-lg px-3 py-2 text-base font-medium text-gray-700 hover:bg-gray-50 active:bg-gray-100 transition-colors disabled:opacity-30 min-h-[44px]"
         >
           What&apos;s on the table?
         </button>
         <button
           onClick={() => handleAction("/api/cleanup", "Clean up the table")}
           disabled={loading}
-          className="flex-1 border border-gray-300 rounded-lg px-3 py-2 text-sm font-medium text-gray-700 hover:bg-gray-50 active:bg-gray-100 transition-colors disabled:opacity-30"
+          className="flex-1 border border-gray-300 rounded-lg px-3 py-2 text-base font-medium text-gray-700 hover:bg-gray-50 active:bg-gray-100 transition-colors disabled:opacity-30 min-h-[44px]"
         >
           Cleanup
         </button>
@@ -198,13 +198,13 @@ export default function ChatPage() {
           value={input}
           onChange={(e) => setInput(e.target.value)}
           disabled={loading}
-          className="flex-1 border border-gray-300 rounded px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-black disabled:opacity-50"
+          className="flex-1 border border-gray-300 rounded px-3 py-2 text-base focus:outline-none focus:ring-2 focus:ring-black disabled:opacity-50 min-h-[44px]"
           autoFocus
         />
         <button
           type="submit"
           disabled={loading || !input.trim()}
-          className="bg-black text-white rounded px-4 py-2 text-sm font-medium hover:bg-gray-800 transition-colors disabled:opacity-30"
+          className="bg-black text-white rounded px-4 py-2 text-base font-medium hover:bg-gray-800 transition-colors disabled:opacity-30 min-h-[44px]"
         >
           Send
         </button>

@@ -9,9 +9,9 @@ Core Use Case: Accessibility for blind/mobility-impaired users.
 
 Hardware Stack:
 - Arduino Uno + CNC Shield V3 running GRBL
-- DRV8825 stepper drivers (X, Y, A axes - A cloned to Y)
+- DRV8825 stepper drivers (X, Y, Z slots — Z mirrors Y in software for dual-Y gantry)
 - 24V power supply
-- NEMA 17 stepper motors
+- 3x NEMA 17 stepper motors (1x X-axis, 2x Y-axis)
 - 400mm x 400mm gantry (2020 aluminum extrusion)
 - Camera (overhead view of table)
 - Magnets under table surface + metal pucks on objects
@@ -31,6 +31,10 @@ import time
 from typing import Optional, Tuple
 
 import cv2
+try:
+    from pynput import keyboard as pynput_keyboard
+except Exception:
+    pynput_keyboard = None
 
 # Audio file paths (relative to this script)
 _SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -66,7 +70,8 @@ from grbl_controller import GRBLController
 from object_tracker import ObjectTracker, TrackedObject
 from voice_control import VoiceController, VoiceCommand, CommandType
 from nlp_voice import NLPVoiceController
-from calibration import CoordinateTransformer, CalibrationWizard, AutoCalibrator
+# Calibration is no longer used — pixel→mm conversion is simple flip+scale.
+# from calibration import CoordinateTransformer, CalibrationWizard, AutoCalibrator
 
 
 class MagicTable:
@@ -101,7 +106,7 @@ class MagicTable:
         self.nlp_voice: Optional[NLPVoiceController] = None
         self.voice: Optional[VoiceController] = None
         self.motor: Optional[GRBLController] = None
-        self.transformer: Optional[CoordinateTransformer] = None
+        self.transformer = None  # No longer used (flip+scale instead)
         
         # State
         self.running = False
@@ -113,6 +118,56 @@ class MagicTable:
         
         # Status message for display
         self._status_message = "Initializing..."
+        
+        # Hold-to-talk keyboard state (global listener)
+        self._keyboard_listener = None
+        self._keys_down: set[str] = set()
+        self._space_hold_latched = False
+        self._c_hold_latched = False
+    
+    def _start_key_listener(self):
+        """Start global key listener for hold-to-talk."""
+        if pynput_keyboard is None or self._keyboard_listener is not None:
+            return
+        
+        def on_press(key):
+            if key == pynput_keyboard.Key.space:
+                self._keys_down.add("space")
+                return
+            try:
+                ch = key.char.lower() if key.char else None
+                if ch == "c":
+                    self._keys_down.add("c")
+            except Exception:
+                pass
+        
+        def on_release(key):
+            if key == pynput_keyboard.Key.space:
+                self._keys_down.discard("space")
+                return
+            try:
+                ch = key.char.lower() if key.char else None
+                if ch == "c":
+                    self._keys_down.discard("c")
+            except Exception:
+                pass
+        
+        self._keyboard_listener = pynput_keyboard.Listener(
+            on_press=on_press,
+            on_release=on_release,
+        )
+        self._keyboard_listener.daemon = True
+        self._keyboard_listener.start()
+    
+    def _stop_key_listener(self):
+        """Stop global key listener."""
+        if self._keyboard_listener:
+            self._keyboard_listener.stop()
+            self._keyboard_listener = None
+        self._keys_down.clear()
+    
+    def _is_key_held(self, key_name: str) -> bool:
+        return key_name in self._keys_down
         
     def initialize(self) -> bool:
         """
@@ -128,50 +183,22 @@ class MagicTable:
         print_config()
         print()
         
-        # Load calibration
-        print("Loading calibration...")
-        self.transformer = CoordinateTransformer()
-        if not self.transformer.load_calibration():
-            print("No saved calibration found.")
-            print("Attempting auto-calibration from blue markers...")
-            
-            # Try to auto-calibrate from a live camera frame
-            auto = AutoCalibrator()
-            cap = cv2.VideoCapture(CAMERA.index)
-            if cap.isOpened():
-                cap.set(cv2.CAP_PROP_FRAME_WIDTH, CAMERA.width)
-                cap.set(cv2.CAP_PROP_FRAME_HEIGHT, CAMERA.height)
-                # Grab a few frames to let the camera stabilize
-                for _ in range(10):
-                    cap.read()
-                ret, frame = cap.read()
-                cap.release()
-                if ret:
-                    result = auto.run_headless(frame)
-                    if result is not None:
-                        self.transformer = result
-                        print("Auto-calibration from markers succeeded!\n")
-                    else:
-                        print("Auto-calibration failed (markers not found).")
-                        print("Falling back to default linear mapping.")
-                        print("Run 'python main.py --calibrate' to calibrate.\n")
-                        wizard = CalibrationWizard()
-                        self.transformer = wizard.quick_calibrate()
-                else:
-                    print("Could not capture frame for auto-calibration.")
-                    wizard = CalibrationWizard()
-                    self.transformer = wizard.quick_calibrate()
-            else:
-                print("Could not open camera for auto-calibration.")
-                wizard = CalibrationWizard()
-                self.transformer = wizard.quick_calibrate()
-        
-        # Initialize object tracker
+        # Initialize object tracker FIRST (opens camera + loads model)
+        # Camera is opened before model load so macOS locks the correct
+        # device index immediately (avoids Continuity Camera stealing it).
         print("\nInitializing object tracker...")
         self.tracker = ObjectTracker(prompts=DETECTION.prompts)
         if not self.tracker.start():
             print("ERROR: Failed to start object tracker")
             return False
+        
+        # Coordinate conversion is now simple flip + scale (no homography needed).
+        # See _pixel_to_physical() — pixel coords are flipped on Y and scaled
+        # to gantry mm using CAMERA and GANTRY dimensions directly.
+        self.transformer = None
+        print(f"\nCoordinate mapping: flip Y + scale")
+        print(f"  Camera {CAMERA.width}x{CAMERA.height} px → "
+              f"Gantry {GANTRY.width_mm:.1f}x{GANTRY.height_mm:.1f} mm")
         
         # Initialize motor controller
         if self.enable_motor:
@@ -184,15 +211,19 @@ class MagicTable:
                 # Set current position as home (soft home)
                 self.motor.soft_home()
         
-        # Initialize NLP voice controller (push-to-talk + Gemini)
+        # Initialize NLP voice controller (push-to-talk + Claude/OpenAI)
         if self.enable_voice:
             print("\nInitializing NLP voice controller...")
             try:
                 self.nlp_voice = NLPVoiceController()
                 self.nlp_voice.calibrate()
+                if pynput_keyboard is None:
+                    print("WARNING: pynput not installed; hold-to-talk disabled (tap mode fallback).")
+                else:
+                    self._start_key_listener()
             except Exception as e:
                 print(f"WARNING: NLP voice controller failed to initialize: {e}")
-                print("Voice control will be unavailable. Check your GEMINI_API_KEY.")
+                print("Voice control will be unavailable. Check your ANTHROPIC_API_KEY.")
                 self.nlp_voice = None
         
         self._status_message = "Ready - Press SPACE to speak a command"
@@ -200,10 +231,12 @@ class MagicTable:
         print("SYSTEM READY")
         print("="*60)
         print("\nKeyboard controls:")
-        print("  SPACE - Push-to-talk: say what object to find")
+        print("  HOLD SPACE - Push-to-talk: say what object to find")
         print("          e.g. 'Hey Jarvis, get me the pill bottle'")
         print("          or   'Clean up this table'")
-        print("  C     - Conversation mode: chat with Jarvis")
+        print("          or   'What's on the table?'")
+        print("  HOLD C     - Conversation mode: chat with Jarvis")
+        print("  D     - Describe table: tell me what's on the table")
         print("  L     - Cleanup mode: move all objects to one side")
         if self.target_label:
             print(f"  V     - Run VLM detection for '{self.target_label}'")
@@ -220,14 +253,62 @@ class MagicTable:
         print(f"\n>>> Voice command: {command.command_type.value} - {command.object_name or 'N/A'}")
     
     def _pixel_to_physical(self, px: float, py: float) -> tuple:
-        """Convert pixel coordinates to physical coordinates."""
-        if self.transformer:
-            return self.transformer.pixel_to_physical(px, py)
-        else:
-            # Fallback: simple linear scaling
-            x = px * (GANTRY.width_mm / 1280)
-            y = py * (GANTRY.height_mm / 720)
-            return x, y
+        """Convert pixel coordinates to motor-ready physical mm.
+
+        Steps:
+          1. Flip X and Y (camera left→gantry right, camera top→gantry far)
+          2. Scale pixel range to gantry travel (mm)
+          3. Apply perspective depth correction (near-camera objects pushed further)
+          4. Apply global reach_scale so the robot moves further toward every target
+          5. Clamp to physical boundaries so we never exceed travel limits
+        """
+        # ── Step 1-2: Linear mapping (with horizontal + vertical flip) ─
+        # Flip X: camera left (px=0) → gantry right (max X),
+        #         camera right (px=width) → gantry left (0)
+        x = (CAMERA.width - px) * (GANTRY.width_mm / CAMERA.width)
+        # Flip Y: camera top (py=0) → far side of gantry (max Y),
+        #         camera bottom (py=height) → front of gantry (Y=0)
+        y = (CAMERA.height - py) * (GANTRY.height_mm / CAMERA.height)
+
+        # ── Step 3: Perspective depth correction ──────────────────────
+        # Objects closer to the camera (bottom of frame, high py) appear
+        # larger due to perspective.  The linear mapping underestimates
+        # their true physical distance from the gantry center.  We scale
+        # the displacement from center by a factor that grows with
+        # proximity to the camera edge.
+        #
+        #   t ∈ [0, 1]: normalised closeness to camera
+        #       0 = top of frame (far from camera)
+        #       1 = bottom of frame (near camera)
+        #
+        #   depth_scale = 1 + correction × t^exponent
+        #
+        # See config.py GantryConfig for tuning guidance.
+        gantry_cx = GANTRY.width_mm / 2.0
+        gantry_cy = GANTRY.height_mm / 2.0
+
+        if GANTRY.perspective_correction > 0:
+            t = py / CAMERA.height  # 0 at top, 1 at bottom (near camera)
+            depth_scale = 1.0 + GANTRY.perspective_correction * (
+                t ** GANTRY.perspective_exponent
+            )
+            x = gantry_cx + (x - gantry_cx) * depth_scale
+            y = gantry_cy + (y - gantry_cy) * depth_scale
+
+        # Global “move more”: scale displacement from center so the robot
+        # travels further toward the target everywhere (still clamped below).
+        if GANTRY.reach_scale != 1.0:
+            x = gantry_cx + (x - gantry_cx) * GANTRY.reach_scale
+            y = gantry_cy + (y - gantry_cy) * GANTRY.reach_scale
+
+        # Scale down the wide (X) direction if it tends to go too far.
+        if GANTRY.width_scale != 1.0:
+            x = gantry_cx + (x - gantry_cx) * GANTRY.width_scale
+
+        # ── Step 4: Clamp to physical travel limits ───────────────────
+        x = max(0.0, min(GANTRY.width_mm, x))
+        y = max(0.0, min(GANTRY.height_mm, y))
+        return x, y
     
     def fetch_object(self, object_name: str) -> bool:
         """
@@ -256,7 +337,7 @@ class MagicTable:
                 return False
             
             # Get pixel position
-            px, py = obj.smooth_x, obj.smooth_y
+            px, py = obj.center_x, obj.center_y
             print(f"Found {object_name} at pixel ({px:.1f}, {py:.1f})")
             
             # Convert to physical coordinates
@@ -305,7 +386,7 @@ class MagicTable:
         """
         obj = self.tracker.find_object(object_name)
         if obj:
-            print(f"Found {object_name} at ({obj.smooth_x:.1f}, {obj.smooth_y:.1f}) pixels")
+            print(f"Found {object_name} at ({obj.center_x:.1f}, {obj.center_y:.1f}) pixels")
             self._status_message = f"Found {object_name}"
         else:
             print(f"Object not found: {object_name}")
@@ -342,25 +423,25 @@ class MagicTable:
         elif command.command_type == CommandType.HOME:
             self.go_home()
     
-    def voice_detect_pipeline(self):
+    def voice_detect_pipeline(self, hold_check=None):
         """
         Full voice-driven pipeline:
         1. Record audio (push-to-talk)
         2. Transcribe speech
-        3. Extract object name via Gemini (or detect goodbye)
+        3. Extract object name via Claude (or detect goodbye)
         4. Run VLM detection for that object
         5. Return and display coordinates
         """
         if not self.nlp_voice:
-            self._status_message = "Voice not available (check GEMINI_API_KEY)"
+            self._status_message = "Voice not available (check ANTHROPIC_API_KEY)"
             return
 
         self._status_message = "LISTENING... speak now"
         # Force a display update so the user sees the status
         self._force_display_update()
 
-        # Step 1-3: Listen and extract object name via Gemini
-        result = self.nlp_voice.listen_and_extract()
+        # Step 1-3: Listen and extract object name via Claude
+        result = self.nlp_voice.listen_and_extract(hold_check=hold_check)
 
         if not result:
             self._status_message = "Didn't catch that. Press SPACE to try again."
@@ -381,6 +462,12 @@ class MagicTable:
             self.cleanup_pipeline()
             return
 
+        # Check if the user asked what's on the table
+        if result == NLPVoiceController.DESCRIBE_TABLE:
+            print("User asked what's on the table.")
+            self.describe_table_pipeline()
+            return
+
         object_name = result
 
         # User asked for an object — acknowledge with "Yes, right away"
@@ -396,14 +483,10 @@ class MagicTable:
             obj = detected[0]
             px, py = obj.center_x, obj.center_y
 
-            # Also compute physical coordinates if calibration is available
+            # Compute physical coordinates
             phys_x, phys_y = self._pixel_to_physical(px, py)
 
             self._last_result = (object_name, px, py)
-            self._status_message = (
-                f"Found '{object_name}' at pixel ({px:.0f}, {py:.0f}) "
-                f"| physical ({phys_x:.0f}, {phys_y:.0f}) mm"
-            )
 
             print("\n" + "=" * 60)
             print(f"RESULT: '{object_name}'")
@@ -411,16 +494,69 @@ class MagicTable:
             print(f"  Physical coords: ({phys_x:.1f}, {phys_y:.1f}) mm")
             print(f"  Confidence:      {obj.confidence:.2f}")
             print("=" * 60 + "\n")
+
+            # ── Move the gantry: home → object → front ──
+            if self.motor and self.motor.connected:
+                self._status_message = f"Fetching '{object_name}'..."
+                self._force_display_update()
+                success = self.motor.drag_object_to(
+                    from_x=phys_x,
+                    from_y=phys_y,
+                    to_x=GANTRY.pickup_x_mm,
+                    to_y=GANTRY.pickup_y_mm,
+                )
+                if success:
+                    self._status_message = f"Delivered '{object_name}' to pickup zone!"
+                    print(f"*** {object_name.upper()} IS READY FOR PICKUP ***")
+                else:
+                    self._status_message = f"Motor move failed for '{object_name}'"
+            else:
+                self._status_message = (
+                    f"Found '{object_name}' at ({phys_x:.0f}, {phys_y:.0f}) mm "
+                    f"[motor not connected]"
+                )
         else:
             self._last_result = None
             self._status_message = f"'{object_name}' not found on table. Press SPACE to try again."
+
+    def describe_table_pipeline(self):
+        """
+        Describe what's on the table — scan with OpenAI Vision and report back.
+
+        When triggered via voice the response is spoken aloud through
+        ElevenLabs TTS.  The result is also shown on the OpenCV display.
+        """
+        self._status_message = "Looking at the table..."
+        self._force_display_update()
+
+        # Grab the latest frame
+        frame = self.tracker.get_frame()
+        if frame is None:
+            frame = self.tracker.capture_frame()
+        if frame is None:
+            self._status_message = "Can't see the table (no camera frame)"
+            return
+
+        if not self.nlp_voice:
+            self._status_message = "Vision not available (check OPENAI_API_KEY for vision)"
+            return
+
+        objects = self.nlp_voice.scan_table_objects(frame)
+        sentence = NLPVoiceController.objects_to_sentence(objects)
+
+        print(f"\nDESCRIBE TABLE: {sentence}")
+        self._status_message = sentence
+        self._force_display_update()
+
+        # Speak the answer aloud
+        self.nlp_voice.speak(sentence)
 
     def cleanup_pipeline(self):
         """
         Cleanup mode — consolidate all scattered objects to one side of the table.
 
         Steps:
-        1. Capture scene, use Gemini Vision to list every object on the table.
+        1. Capture scene, use OpenAI Vision to list every object on the table.
         2. For each object, run VLM detection to get pixel coordinates.
         3. Convert to physical coords; skip if already on the "clean" side.
         4. Drag the object to the cleanup edge (preserving its Y position).
@@ -435,7 +571,7 @@ class MagicTable:
         self._force_display_update()
 
         try:
-            # ── Step 1: Capture scene & identify objects via Gemini Vision ──
+            # ── Step 1: Capture scene & identify objects via OpenAI Vision ──
             frame = self.tracker.get_frame()
             if frame is None:
                 frame = self.tracker.capture_frame()
@@ -444,7 +580,7 @@ class MagicTable:
                 return
 
             if not self.nlp_voice:
-                self._status_message = "Cleanup requires Gemini (check API key)"
+                self._status_message = "Cleanup requires OpenAI Vision (check OPENAI_API_KEY)"
                 return
 
             objects = self.nlp_voice.scan_table_objects(frame)
@@ -530,23 +666,23 @@ class MagicTable:
         finally:
             self._busy = False
 
-    def conversation_pipeline(self):
+    def conversation_pipeline(self, hold_check=None):
         """
         Conversational mode:
         1. Record audio (push-to-talk)
         2. Transcribe speech
-        3. Send to Gemini for conversational response
+        3. Send to Claude for conversational response
         4. Speak the response via ElevenLabs TTS
         """
         if not self.nlp_voice:
-            self._status_message = "Voice not available (check GEMINI_API_KEY)"
+            self._status_message = "Voice not available (check ANTHROPIC_API_KEY)"
             return
 
         self._status_message = "LISTENING... (conversation mode)"
         self._force_display_update()
 
         # Record and transcribe
-        text = self.nlp_voice.record_and_transcribe()
+        text = self.nlp_voice.record_and_transcribe(hold_check=hold_check)
 
         if not text:
             self._status_message = "Didn't catch that. Press C to try again."
@@ -555,11 +691,11 @@ class MagicTable:
         self._status_message = f"You said: '{text}' — thinking..."
         self._force_display_update()
 
-        # Get Gemini's conversational response
+        # Get Claude's conversational response
         reply = self.nlp_voice.converse(text)
 
         if not reply:
-            self._status_message = "No response from Gemini."
+            self._status_message = "No response from Claude."
             return
 
         self._status_message = f"Jarvis: {reply}"
@@ -589,7 +725,7 @@ class MagicTable:
         This is the main event loop that:
         1. Captures camera frames
         2. Waits for user input
-        3. SPACE: push-to-talk → Gemini NLP → VLM → coordinates
+        3. SPACE: push-to-talk → Claude NLP → VLM → coordinates
         4. V: manual VLM detection with preset label
         """
         self.running = True
@@ -606,8 +742,8 @@ class MagicTable:
                 
                 # Draw instructions at top
                 h, w = display.shape[:2]
-                cv2.putText(display, "SPACE: fetch | C: chat | L: cleanup | Q: quit", (10, 30),
-                           cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+                cv2.putText(display, "SPACE: fetch | C: chat | D: describe | L: cleanup | Q: quit",
+                           (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 255), 2)
                 
                 # Draw object list if any detected
                 objects = self.tracker.list_visible_objects()
@@ -638,11 +774,29 @@ class MagicTable:
                 # Display
                 cv2.imshow("Magic Table", display)
                 
+                # Handle hold-to-talk (SPACE/C). Triggers once per hold.
+                if self.enable_voice and self.nlp_voice and self._keyboard_listener:
+                    if self._is_key_held("space") and not self._space_hold_latched:
+                        self._space_hold_latched = True
+                        self.voice_detect_pipeline(
+                            hold_check=lambda: self._is_key_held("space")
+                        )
+                    elif not self._is_key_held("space"):
+                        self._space_hold_latched = False
+                    
+                    if self._is_key_held("c") and not self._c_hold_latched:
+                        self._c_hold_latched = True
+                        self.conversation_pipeline(
+                            hold_check=lambda: self._is_key_held("c")
+                        )
+                    elif not self._is_key_held("c"):
+                        self._c_hold_latched = False
+                
                 # Handle keyboard
                 key = cv2.waitKey(1) & 0xFF
                 if key == ord('q'):
                     self.running = False
-                elif key == ord(' '):
+                elif key == ord(' ') and not self._keyboard_listener:
                     # SPACE: Push-to-talk voice pipeline
                     self.voice_detect_pipeline()
                 elif key == ord('v') and self.target_label:
@@ -658,9 +812,12 @@ class MagicTable:
                         )
                     else:
                         self._status_message = f"'{self.target_label}' not found."
-                elif key == ord('c'):
+                elif key == ord('c') and not self._keyboard_listener:
                     # C: Conversation mode
                     self.conversation_pipeline()
+                elif key == ord('d'):
+                    # D: Describe table — what's on the table?
+                    self.describe_table_pipeline()
                 elif key == ord('l'):
                     # L: Cleanup mode — move all objects to one side
                     play_audio(AUDIO_YES_RIGHT_AWAY)
@@ -691,19 +848,30 @@ class MagicTable:
             if self.tracker:
                 self.tracker.stop()
             
+            self._stop_key_listener()
+            
             cv2.destroyAllWindows()
             
             print("Shutdown complete.")
 
 
-def run_calibration(manual: bool = False):
+def run_calibration(
+    mode: str = "auto",
+    grid_cols: int = 4,
+    grid_rows: int = 3,
+):
     """
-    Run camera calibration.
-    
-    By default uses automatic blue-marker detection.
-    Pass manual=True to use the old interactive click wizard.
+    Run camera/gantry calibration.
+
+    Modes:
+      - auto: blue-marker detection
+      - manual: click 4 corners (optional motor assist)
+      - motor-sweep: move gantry through a grid, click magnet at each stop
     """
-    if manual:
+    # Lazy-import calibration only when running standalone calibration CLI
+    from calibration import CalibrationWizard, AutoCalibrator, MotorSweepCalibrator
+
+    if mode == "manual":
         print("Starting manual calibration wizard...")
         motor = GRBLController()
         if motor.connect():
@@ -715,6 +883,22 @@ def run_calibration(manual: bool = False):
         wizard.run_wizard(grbl_controller=motor)
         
         if motor:
+            motor.disconnect()
+    elif mode == "motor-sweep":
+        print("Starting motor sweep calibration...")
+        motor = GRBLController()
+        if not motor.connect():
+            print("ERROR: Motor sweep calibration requires motor connection.")
+            return
+        try:
+            motor.soft_home()
+            calibrator = MotorSweepCalibrator()
+            calibrator.run(
+                grbl_controller=motor,
+                grid_cols=grid_cols,
+                grid_rows=grid_rows,
+            )
+        finally:
             motor.disconnect()
     else:
         print("Starting auto-calibration (blue marker detection)...")
@@ -756,6 +940,23 @@ def main():
         help="Run manual calibration wizard (click corners)"
     )
     parser.add_argument(
+        "--calibrate-motor",
+        action="store_true",
+        help="Run motor sweep calibration (moves gantry across a point grid)"
+    )
+    parser.add_argument(
+        "--cal-grid-x",
+        type=int,
+        default=4,
+        help="Motor sweep calibration grid columns (default: 4)"
+    )
+    parser.add_argument(
+        "--cal-grid-y",
+        type=int,
+        default=3,
+        help="Motor sweep calibration grid rows (default: 3)"
+    )
+    parser.add_argument(
         "--test-vision",
         action="store_true",
         help="Test vision system only"
@@ -792,11 +993,19 @@ def main():
     
     # Handle special test modes
     if args.calibrate:
-        run_calibration(manual=False)
+        run_calibration(mode="auto")
         return
     
     if args.calibrate_manual:
-        run_calibration(manual=True)
+        run_calibration(mode="manual")
+        return
+
+    if args.calibrate_motor:
+        run_calibration(
+            mode="motor-sweep",
+            grid_cols=args.cal_grid_x,
+            grid_rows=args.cal_grid_y,
+        )
         return
     
     if args.test_vision:
